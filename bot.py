@@ -43,7 +43,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 sesiones = defaultdict(list)
 
 # Registro del último mensaje por usuario+canal para saltar duplicados
-ultimo_mensaje = defaultdict(lambda: {"texto": "", "tiempo": 0.0})
+ultimo_mensaje = defaultdict(lambda: {"texto": "", "archivos": "", "tiempo": 0.0})
 
 MIME_MAP = {
     "image/png": "imagen",
@@ -170,17 +170,24 @@ async def on_message(message):
     clave = (message.author.id, canal_id)
     ahora = time.time()
     ultimo = ultimo_mensaje[clave]
-    iguales = texto == ultimo["texto"].strip()
+
+    nombres_archivos = ",".join(a.filename or "" for a in message.attachments)
+    iguales_texto = texto == ultimo["texto"].strip()
     texto_normalizado = re.sub(r"\s+", " ", texto).strip().lower()
     ultimo_normalizado = re.sub(r"\s+", " ", ultimo["texto"].strip()).lower()
     casi_iguales = (
         texto_normalizado and
         texto_normalizado == ultimo_normalizado
     )
-    if (iguales or casi_iguales) and (ahora - ultimo["tiempo"] <= 10):
+    mismos_archivos = (
+        bool(message.attachments) and
+        ultimo["archivos"] and
+        nombres_archivos == ultimo["archivos"]
+    )
+    if (iguales_texto or casi_iguales or mismos_archivos) and (ahora - ultimo["tiempo"] <= 10):
         return
 
-    ultimo_mensaje[clave] = {"texto": texto, "tiempo": ahora}
+    ultimo_mensaje[clave] = {"texto": texto, "archivos": nombres_archivos, "tiempo": ahora}
 
     async with message.channel.typing():
         try:
