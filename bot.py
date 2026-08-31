@@ -2,6 +2,7 @@ import os
 import re
 import time
 import base64
+import asyncio
 from collections import defaultdict
 import discord
 from discord.ext import commands
@@ -77,7 +78,7 @@ EXTENSION_MIME = {
 
 
 async def llamar_gemini(client, historia):
-    """Envía la historia a Gemini por HTTP directo y devuelve el texto de respuesta."""
+    """Envía la historia a Gemini por HTTP directo con reintentos automáticos si se satura la cuota."""
     contenido = []
     for turno in historia:
         contenido.append({"role": turno["role"], "parts": turno["parts"]})
@@ -92,15 +93,40 @@ async def llamar_gemini(client, historia):
         "Content-Type": "application/json",
     }
 
-    async with client.post(URL_GEMINI, headers=cabeceras, json=cuerpo) as resp:
-        datos = await resp.json()
-        if resp.status != 200:
+    intentos = 0
+    while True:
+        async with client.post(URL_GEMINI, headers=cabeceras, json=cuerpo) as resp:
+            datos = await resp.json()
+            if resp.status == 200:
+                try:
+                    return datos["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError):
+                    return None
+
             msg = datos.get("error", {}).get("message", f"HTTP {resp.status}")
-            raise RuntimeError(msg)
-        try:
-            return datos["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            return None
+            es_cuota = (
+                resp.status == 429
+                or "quota" in msg.lower()
+                or "rate" in msg.lower()
+                or "resource exhausted" in msg.lower()
+            )
+            if not es_cuota:
+                raise RuntimeError(msg)
+
+            espera = None
+            m = re.search(r"retry in ([\d.]+)", msg, flags=re.IGNORECASE)
+            if m:
+                espera = float(m.group(1))
+            if not espera:
+                espera = 5.0
+            espera += 2
+
+            intentos += 1
+            if intentos >= 5:
+                raise RuntimeError(
+                    "El plan gratuito de la IA está saturado. Esperá ~1 minuto y volvé a intentar."
+                )
+            await asyncio.sleep(min(espera, 60))
 
 
 @bot.event
