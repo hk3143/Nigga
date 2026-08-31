@@ -24,11 +24,13 @@ SYSTEM_PROMPT = (
     "usa SIEMPRE signos y símbolos matemáticos claros y legibles en lugar de texto plano. "
     "Usa el símbolo ÷ para dividir, × para multiplicar, √ para raíz cuadrada, "
     "² para al cuadrado, ³ para al cubo, y escribe las fracciones en forma de barra "
-    "como a/b o con el formato visual equivalente. Usa signos de puntuación correctos "
-    "(igual =, más +, menos −) y presenta cada paso de forma ordenada y fácil de leer. "
-    "Si el chat soporta LaTeX/fórmulas, puedes usarlas con el formato $...$ o $$...$$, "
-    "pero siempre incluye también los símbolos matemáticos directamente visibles "
-    "para que se entiendan sin necesidad de plugins."
+    "como a/b. Usa signos de puntuación correctos (igual =, más +, menos −) y presenta "
+    "cada paso de forma ordenada y fácil de leer. "
+    "NO uses formato LaTeX ni rodees las fórmulas con símbolos de dólar ($ o $$). "
+    "Escribe todas las matemáticas con símbolos Unicode directamente visibles, "
+    "nunca dejes código crudo como '\\cdot', '\\frac' o '\\sqrt'. "
+    "Por ejemplo, en vez de '$$x \\cdot y = k$$' escribe:  x × y = k. "
+    "Y en vez de '$$m = \\frac{36}{4}$$' escribe:  m = 36 ÷ 4 = 9."
 )
 
 intents = discord.Intents.default()
@@ -120,6 +122,8 @@ async def enviar_respuesta(message, texto):
     if not texto or texto.strip() == "":
         texto = "No pude generar una respuesta. Intenta reformular tu pregunta."
     texto = re.sub(r"<thought>.*?</thought>", "", texto, flags=re.DOTALL).strip()
+    # Quitar símbolos de dólar (LaTeX) para que las fórmulas se vean limpias en Discord
+    texto = texto.replace("$$", " ").replace("$", " ")
     if len(texto) > 1800:
         bloques = [texto[i : i + 1800] for i in range(0, len(texto), 1800)]
         for i, bloque in enumerate(bloques):
