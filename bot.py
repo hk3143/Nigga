@@ -1,13 +1,16 @@
 import os
-from io import BytesIO
-from collections import defaultdict
 import re
+import base64
+from collections import defaultdict
 import discord
 from discord.ext import commands
-import google.generativeai as genai
+import aiohttp
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+MODELO = "gemini-3.6-flash"
+URL_GEMINI = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELO}:generateContent"
 
 SYSTEM_PROMPT = (
     "Eres IA Pro, un asistente virtual en Discord, amigable y conversacional. "
@@ -18,20 +21,14 @@ SYSTEM_PROMPT = (
     "Si te escriben sin archivo, mantén una conversación normal y útil."
 )
 
-genai.configure(api_key=GEMINI_API_KEY, transport="rest")
-model = genai.GenerativeModel(
-    "gemini-3.6-flash",
-    system_instruction=SYSTEM_PROMPT,
-)
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.typing = False
 intents.presences = False
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Guarda una ChatSession por canal para tener memoria
-sesiones = defaultdict(lambda: model.start_chat(history=[]))
+# Guarda el historial por canal: lista de dicts {"role":..., "parts":[...]}
+sesiones = defaultdict(list)
 
 MIME_MAP = {
     "image/png": "imagen",
@@ -64,6 +61,33 @@ EXTENSION_MIME = {
 }
 
 
+async def llamar_gemini(client, historia):
+    """Envía la historia a Gemini por HTTP directo y devuelve el texto de respuesta."""
+    contenido = []
+    for turno in historia:
+        contenido.append({"role": turno["role"], "parts": turno["parts"]})
+
+    cuerpo = {
+        "contents": contenido,
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+    }
+
+    cabeceras = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    async with client.post(URL_GEMINI, headers=cabeceras, json=cuerpo) as resp:
+        datos = await resp.json()
+        if resp.status != 200:
+            msg = datos.get("error", {}).get("message", f"HTTP {resp.status}")
+            raise RuntimeError(msg)
+        try:
+            return datos["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            return None
+
+
 @bot.event
 async def on_ready():
     print(f"IA Pro conectado como {bot.user}")
@@ -82,7 +106,6 @@ async def obtener_mime(attachment):
 async def enviar_respuesta(message, texto):
     if not texto or texto.strip() == "":
         texto = "No pude generar una respuesta. Intenta reformular tu pregunta."
-    # Limpiar etiquetas de pensamiento de algunos modelos
     texto = re.sub(r"<thought>.*?</thought>", "", texto, flags=re.DOTALL).strip()
     if len(texto) > 1800:
         bloques = [texto[i : i + 1800] for i in range(0, len(texto), 1800)]
@@ -105,9 +128,8 @@ async def on_message(message):
     tiene_archivo = bool(message.attachments)
     texto = message.content.strip()
 
-    # Comandos especiales
     if contenido in ("!nuevo", "!reset", "!limpiar"):
-        sesiones[canal_id] = model.start_chat(history=[])
+        sesiones[canal_id] = []
         await message.reply("🧹 Conversación reiniciada. ¡Pregúntame lo que quieras!")
         return
 
@@ -124,43 +146,40 @@ async def on_message(message):
         )
         return
 
-    # Solo responder si hay texto o archivo
     if not tiene_archivo and not texto:
         return
 
     async with message.channel.typing():
         try:
-            chat = sesiones[canal_id]
+            partes_usuario = []
 
             if tiene_archivo:
-                partes = []
                 for attachment in message.attachments:
                     mime, tipo = await obtener_mime(attachment)
-                    if mime:
-                        file_bytes = await attachment.read()
-                        if tipo == "imagen":
-                            partes.append({"mime_type": mime, "data": file_bytes})
-                        else:
-                            archivo = genai.upload_file(
-                                BytesIO(file_bytes),
-                                display_name=attachment.filename or "documento",
-                                mime_type=mime,
-                            )
-                            partes.append(archivo)
-                if texto:
-                    partes.append(texto)
-                if not partes:
-                    return
+                    if not mime:
+                        continue
+                    file_bytes = await attachment.read()
+                    b64 = base64.b64encode(file_bytes).decode("utf-8")
+                    partes_usuario.append({
+                        "inline_data": {"mime_type": mime, "data": b64},
+                    })
 
-                response = chat.send_message(partes)
-            else:
-                response = chat.send_message(texto)
+            if texto:
+                partes_usuario.append({"text": texto})
+            if not partes_usuario:
+                return
 
-            respuesta = response.text
+            sesiones[canal_id].append({"role": "user", "parts": partes_usuario})
 
-            # Si el historial crece demasiado, reiniciarlo para evitar errores de tokens
-            if len(chat.history) > 24:
-                sesiones[canal_id] = model.start_chat(history=[])
+            async with aiohttp.ClientSession() as client:
+                respuesta = await llamar_gemini(client, sesiones[canal_id])
+
+            if respuesta:
+                sesiones[canal_id].append({"role": "model", "parts": [{"text": respuesta}]})
+
+            # Limitar el historial para no exceder tokens
+            if len(sesiones[canal_id]) > 30:
+                sesiones[canal_id] = sesiones[canal_id][-20:]
 
             await enviar_respuesta(message, respuesta)
 
