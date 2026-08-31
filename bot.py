@@ -1,5 +1,7 @@
 import os
 from io import BytesIO
+from collections import defaultdict
+import re
 import discord
 from discord.ext import commands
 import google.generativeai as genai
@@ -7,30 +9,30 @@ import google.generativeai as genai
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+SYSTEM_PROMPT = (
+    "Eres IA Pro, un asistente virtual en Discord, amigable y conversacional. "
+    "Ayudas a estudiar y respondes cualquier pregunta. "
+    "Cuando el usuario adjunte una imagen o documento (PDF, Word, PowerPoint, texto), "
+    "analízalo y ayúdalo: explícalo, resúmelo, resuelve ejercicios, traduce o transcribe el texto. "
+    "Responde SIEMPRE en español, de forma clara, amable y educada. "
+    "Si te escriben sin archivo, mantén una conversación normal y útil."
+)
+
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3.6-flash")
+model = genai.GenerativeModel(
+    "gemini-3.6-flash",
+    system_instruction=SYSTEM_PROMPT,
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.typing = False
+intents.presences = False
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-SYSTEM_PROMPT = (
-    "Eres un asistente de estudio en español, amable y detallado. "
-    "Cuando recibas una imagen o un documento, tu tarea es ayudar a la persona a estudiar. "
-    "Puedes: explicar el contenido, resolver ejercicios paso a paso, transcribir el texto (OCR), "
-    "resumir documentos, o traducirlo. Responde siempre en español, claro y educativo."
-)
+# Guarda una ChatSession por canal para tener memoria
+sesiones = defaultdict(lambda: model.start_chat(history=[]))
 
-INSTRUCCIONES = {
-    "explica": "Explica claramente el contenido de este archivo como material de estudio.",
-    "resuelve": "Resuelve el ejercicio mostrado paso a paso y explica el razonamiento.",
-    "traduce": "Traduce todo el texto visible al español.",
-    "leo": "Transcribe todo el texto visible de forma fiel (OCR).",
-    "resumen": "Haz un resumen claro y organizado con los puntos más importantes del documento.",
-    "temario": "Extrae y organiza un temario/índice con los temas principales del documento.",
-}
-
-# Tipos de archivo soportados
 MIME_MAP = {
     "image/png": "imagen",
     "image/jpeg": "imagen",
@@ -46,7 +48,6 @@ MIME_MAP = {
     "text/plain": "texto",
 }
 
-# Algunos adjuntos traen el mimetype vacío, así que también usamos la extensión
 EXTENSION_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -65,100 +66,106 @@ EXTENSION_MIME = {
 
 @bot.event
 async def on_ready():
-    print(f"Bot conectado como {bot.user}")
+    print(f"IA Pro conectado como {bot.user}")
 
 
-@bot.command(name="ayuda")
-async def ayuda(ctx):
-    embed = discord.Embed(
-        title="📚 Bot de Estudio",
-        description=(
-            "¡Hola! Soy tu asistente de estudio.\n\n"
-            "Sube un archivo (📷 imagen, 📄 Word, 📕 PDF o 📊 PowerPoint) "
-            "y escribe uno de estos comandos en el mismo mensaje:\n\n"
-            "• `!explica` - Explica el contenido\n"
-            "• `!resuelve` - Resuelve ejercicios paso a paso\n"
-            "• `!traduce` - Traduce el texto al español\n"
-            "• `!leo` - Transcribe el texto (OCR)\n"
-            "• `!resumen` - Resumen del documento\n"
-            "• `!temario` - Temario/índice de temas\n\n"
-            "**Ejemplo:** sube un PDF y escribe `!resumen`.\n\n"
-            "También escribe **!ayuda** para ver este menú."
-        ),
-        color=0x00FF00,
-    )
-    await ctx.send(embed=embed)
-
-
-async def analizar_archivo(ctx, tarea):
-    if not ctx.message.attachments:
-        await ctx.send(f"Adjunta un archivo en el mismo mensaje con `!{tarea}`.")
-        return
-
-    attachment = ctx.message.attachments[0]
-
-    # Determinar el mimetype
+async def obtener_mime(attachment):
     mime = attachment.content_type
     if not mime or mime not in MIME_MAP:
         ext = os.path.splitext(attachment.filename or "")[1].lower()
         mime = EXTENSION_MIME.get(ext)
+    if mime and mime in MIME_MAP:
+        return mime, MIME_MAP[mime]
+    return None, None
 
-    if not mime or mime not in MIME_MAP:
-        await ctx.send(
-            "❌ No reconozco ese tipo de archivo. "
-            "Sirve para: imágenes (PNG/JPG/GIF/WEBP/BMP), PDF, Word (.doc/.docx), "
-            "PowerPoint (.ppt/.pptx) y texto (.txt)."
+
+async def enviar_respuesta(message, texto):
+    if not texto or texto.strip() == "":
+        texto = "No pude generar una respuesta. Intenta reformular tu pregunta."
+    # Limpiar etiquetas de pensamiento de algunos modelos
+    texto = re.sub(r"<thought>.*?</thought>", "", texto, flags=re.DOTALL).strip()
+    if len(texto) > 1800:
+        bloques = [texto[i : i + 1800] for i in range(0, len(texto), 1800)]
+        for i, bloque in enumerate(bloques):
+            if i == 0:
+                await message.reply(bloque)
+            else:
+                await message.channel.send(bloque)
+    else:
+        await message.reply(texto)
+
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    canal_id = message.channel.id
+    contenido = message.content.strip().lower()
+    tiene_archivo = bool(message.attachments)
+    texto = message.content.strip()
+
+    # Comandos especiales
+    if contenido in ("!nuevo", "!reset", "!limpiar"):
+        sesiones[canal_id] = model.start_chat(history=[])
+        await message.reply("🧹 Conversación reiniciada. ¡Pregúntame lo que quieras!")
+        return
+
+    if contenido in ("!ayuda", "!help"):
+        await message.reply(
+            "¡Hola! Soy **IA Pro** 🤖.\n\n"
+            "Háblame como a un chat normal: pregúntame lo que sea y te respondo.\n\n"
+            "**📷📄 Sube archivos** (imágenes, PDF, Word, PowerPoint) y los analizo automáticamente: "
+            "los explico, resumo, resuelvo ejercicios o traduzco.\n\n"
+            "Comandos:\n"
+            "• `!nuevo` - Reinicia la conversación\n"
+            "• `!ayuda` - Este menú\n\n"
+            "¡Empecemos! 😊"
         )
         return
 
-    tipo = MIME_MAP[mime]
-    procesando = await ctx.send(f"⏳ Analizando el archivo...")
+    # Solo responder si hay texto o archivo
+    if not tiene_archivo and not texto:
+        return
 
-    try:
-        file_bytes = await attachment.read()
-        instruccion = INSTRUCCIONES.get(tarea, "Analiza este archivo.")
+    async with message.channel.typing():
+        try:
+            chat = sesiones[canal_id]
 
-        partes = [SYSTEM_PROMPT, instruccion]
-        if tipo == "imagen":
-            partes.append({"mime_type": mime, "data": file_bytes})
-        else:
-            # Sube el archivo de documento al cliente de Gemini
-            archivo = genai.upload_file(
-                BytesIO(file_bytes),
-                display_name=attachment.filename or "documento",
-                mime_type=mime,
-            )
-            partes.append(archivo)
+            if tiene_archivo:
+                partes = []
+                for attachment in message.attachments:
+                    mime, tipo = await obtener_mime(attachment)
+                    if mime:
+                        file_bytes = await attachment.read()
+                        if tipo == "imagen":
+                            partes.append({"mime_type": mime, "data": file_bytes})
+                        else:
+                            archivo = genai.upload_file(
+                                BytesIO(file_bytes),
+                                display_name=attachment.filename or "documento",
+                                mime_type=mime,
+                            )
+                            partes.append(archivo)
+                if texto:
+                    partes.append(texto)
+                if not partes:
+                    return
 
-        response = model.generate_content(partes)
+                response = chat.send_message(partes)
+            else:
+                response = chat.send_message(texto)
 
-        respuesta = response.text
-        if not respuesta or respuesta.strip() == "":
-            respuesta = "No pude extraer información de ese archivo. Intenta con otro."
+            respuesta = response.text
 
-        if len(respuesta) > 1800:
-            bloques = [respuesta[i : i + 1800] for i in range(0, len(respuesta), 1800)]
-            for i, bloque in enumerate(bloques):
-                if i == 0:
-                    await procesando.edit(content=bloque)
-                else:
-                    await ctx.send(bloque)
-        else:
-            await procesando.edit(content=respuesta)
+            # Si el historial crece demasiado, reiniciarlo para evitar errores de tokens
+            if len(chat.history) > 24:
+                sesiones[canal_id] = model.start_chat(history=[])
 
-    except Exception as e:
-        await procesando.edit(content=f"❌ Ocurrió un error: {str(e)}")
+            await enviar_respuesta(message, respuesta)
 
-
-def crear_comando(nombre):
-    @bot.command(name=nombre)
-    async def _cmd(ctx):
-        await analizar_archivo(ctx, nombre)
-    return _cmd
-
-
-for comando in INSTRUCCIONES:
-    crear_comando(comando)
+        except Exception as e:
+            await message.reply(f"❌ Ocurrió un error: {str(e)}")
 
 
 if __name__ == "__main__":
