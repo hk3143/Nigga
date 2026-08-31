@@ -18,7 +18,7 @@ SYSTEM_PROMPT = (
     "Si te escriben sin archivo, mantén una conversación normal y útil."
 )
 
-genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY, transport="rest")
 model = genai.GenerativeModel(
     "gemini-3.6-flash",
     system_instruction=SYSTEM_PROMPT,
