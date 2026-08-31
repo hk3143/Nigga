@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import base64
 from collections import defaultdict
 import discord
@@ -18,7 +19,16 @@ SYSTEM_PROMPT = (
     "Cuando el usuario adjunte una imagen o documento (PDF, Word, PowerPoint, texto), "
     "analízalo y ayúdalo: explícalo, resúmelo, resuelve ejercicios, traduce o transcribe el texto. "
     "Responde SIEMPRE en español, de forma clara, amable y educada. "
-    "Si te escriben sin archivo, mantén una conversación normal y útil."
+    "Si te escriben sin archivo, mantén una conversación normal y útil. "
+    "IMPORTANTE PARA MATEMÁTICAS: Cuando resuelvas ejercicios o muestres operaciones, "
+    "usa SIEMPRE signos y símbolos matemáticos claros y legibles en lugar de texto plano. "
+    "Usa el símbolo ÷ para dividir, × para multiplicar, √ para raíz cuadrada, "
+    "² para al cuadrado, ³ para al cubo, y escribe las fracciones en forma de barra "
+    "como a/b o con el formato visual equivalente. Usa signos de puntuación correctos "
+    "(igual =, más +, menos −) y presenta cada paso de forma ordenada y fácil de leer. "
+    "Si el chat soporta LaTeX/fórmulas, puedes usarlas con el formato $...$ o $$...$$, "
+    "pero siempre incluye también los símbolos matemáticos directamente visibles "
+    "para que se entiendan sin necesidad de plugins."
 )
 
 intents = discord.Intents.default()
@@ -29,6 +39,9 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Guarda el historial por canal: lista de dicts {"role":..., "parts":[...]}
 sesiones = defaultdict(list)
+
+# Registro del último mensaje por usuario+canal para saltar duplicados
+ultimo_mensaje = defaultdict(lambda: {"texto": "", "tiempo": 0.0})
 
 MIME_MAP = {
     "image/png": "imagen",
@@ -148,6 +161,22 @@ async def on_message(message):
 
     if not tiene_archivo and not texto:
         return
+
+    # Saltar mensajes duplicados o casi idénticos del mismo usuario
+    clave = (message.author.id, canal_id)
+    ahora = time.time()
+    ultimo = ultimo_mensaje[clave]
+    iguales = texto == ultimo["texto"].strip()
+    texto_normalizado = re.sub(r"\s+", " ", texto).strip().lower()
+    ultimo_normalizado = re.sub(r"\s+", " ", ultimo["texto"].strip()).lower()
+    casi_iguales = (
+        texto_normalizado and
+        texto_normalizado == ultimo_normalizado
+    )
+    if (iguales or casi_iguales) and (ahora - ultimo["tiempo"] <= 10):
+        return
+
+    ultimo_mensaje[clave] = {"texto": texto, "tiempo": ahora}
 
     async with message.channel.typing():
         try:
